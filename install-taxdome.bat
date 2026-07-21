@@ -9,6 +9,3 @@ if %errorlevel% neq 0 (
 
 echo Running installer...
 powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/harshal16saini/provisioning-toolkit/main/install-taxdome.ps1 | iex"
-
-echo.
-pause
