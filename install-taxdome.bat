@@ -1,5 +1,5 @@
 @echo off
-:: Self-elevate to admin, preserving the launch folder
+:: Self-elevate to admin
 net session >nul 2>&1
 if %errorlevel% neq 0 (
     echo Requesting administrator privileges...
