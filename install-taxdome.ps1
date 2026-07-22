@@ -55,14 +55,23 @@ function Get-TaxDomeV4 {
 $installed = Get-TaxDomeV4
 
 function Copy-Shortcut {
-    # Find the TaxDome v4 shortcut anywhere it may have been created, copy to launch dir
+    # If a TaxDome shortcut already exists in the launch folder, do nothing
+    $existing = Get-ChildItem (Join-Path $launchDir '*TaxDome*.lnk') -ErrorAction SilentlyContinue
+    if ($existing) {
+        Write-Host "Shortcut already present in $launchDir. Skipping copy." -ForegroundColor Green
+        return
+    }
+
+    # Otherwise find a source shortcut elsewhere and copy one in
     $src = Get-ChildItem "C:\Users\*\Desktop\*TaxDome*.lnk","C:\Users\Public\Desktop\*TaxDome*.lnk" -ErrorAction SilentlyContinue |
+           Where-Object { $_.DirectoryName -ne $launchDir.TrimEnd('\') } |
            Select-Object -First 1
+
     if ($src) {
         Copy-Item $src.FullName $launchDir -Force -ErrorAction SilentlyContinue
         Write-Host "Shortcut copied to $launchDir" -ForegroundColor Green
     } else {
-        Write-Host "No TaxDome shortcut found to copy." -ForegroundColor Yellow
+        Write-Host "No TaxDome shortcut found to copy (or already in place)." -ForegroundColor Yellow
     }
 }
 
