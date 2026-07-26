@@ -137,7 +137,7 @@ if ($needInstall) {
 }
 
 # --- Always copy shortcut to launch folder (whether installed or already present) ---
-Copy-Shortcut
+#Copy-Shortcut
 
 Write-Host ""
 Write-Host "This window will close in 10 seconds..."
