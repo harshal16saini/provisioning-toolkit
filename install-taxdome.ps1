@@ -56,17 +56,16 @@ function Protect-V3Shortcut {
     $lnk = Join-Path $pub 'TaxDome.lnk'
     if (-not (Test-Path $lnk)) { return }
 
-    # Read the shortcut's target so we don't accidentally rename a v4 shortcut
+    # Read the shortcut's target
     try {
         $ws     = New-Object -ComObject WScript.Shell
         $target = $ws.CreateShortcut($lnk).TargetPath
     } catch { $target = '' }
 
-    $isV4 = $target -match 'TaxDome Desktop App'
-    if (-not $isV4 -and $installed -and $installed.InstallLocation) {
-        $isV4 = $target -like "$($installed.InstallLocation)*"
+    # Only rename if we can POSITIVELY confirm it points to the old v3 install
+    if ($target -notlike 'C:\Program Files (x86)\TaxDome\*') {
+        return   # v4 shortcut, unknown, or unreadable -> leave it alone
     }
-    if ($isV4) { return }   # already the v4 shortcut, leave it
 
     $keep = Join-Path $pub 'TaxDome v3.lnk'
     if (Test-Path $keep) { return }   # preserved on a previous run
