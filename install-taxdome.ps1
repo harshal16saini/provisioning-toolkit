@@ -1,6 +1,9 @@
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+# --- Force TLS 1.2 for older hosts (Server 2016 / stock PS 5.1) ---
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
 # --- Disable QuickEdit so a stray click can't freeze execution ---
 $sig = @'
 using System;
@@ -29,13 +32,6 @@ $fallback = "https://github.com/harshal16saini/provisioning-toolkit/releases/dow
 $exe = "C:\Temp\TaxDome_x64.exe"
 $log = "C:\Temp\td_install.log"
 
-# Where to place the shortcut = folder the .bat was launched from
-$launchDir = $env:TD_LAUNCHDIR
-if ([string]::IsNullOrWhiteSpace($launchDir) -or -not (Test-Path $launchDir)) {
-    $launchDir = [Environment]::GetFolderPath('Desktop')  # fallback
-    Write-Warning "Launch folder not provided; falling back to $launchDir"
-}
-
 New-Item -ItemType Directory -Path 'C:\Temp' -Force | Out-Null
 
 # --- Detect installed v4 app (NOT the v3 "TaxDome" entry) ---
@@ -54,24 +50,32 @@ function Get-TaxDomeV4 {
 
 $installed = Get-TaxDomeV4
 
-function Copy-Shortcut {
-    # If a TaxDome shortcut already exists in the launch folder, do nothing
-    $existing = Get-ChildItem (Join-Path $launchDir '*TaxDome*.lnk') -ErrorAction SilentlyContinue
-    if ($existing) {
-        Write-Host "Shortcut already present in $launchDir. Skipping copy." -ForegroundColor Green
-        return
+# --- Preserve the old (v3) shortcut before v4's installer overwrites it ---
+function Protect-V3Shortcut {
+    $pub = Join-Path $env:PUBLIC 'Desktop'
+    $lnk = Join-Path $pub 'TaxDome.lnk'
+    if (-not (Test-Path $lnk)) { return }
+
+    # Read the shortcut's target so we don't accidentally rename a v4 shortcut
+    try {
+        $ws     = New-Object -ComObject WScript.Shell
+        $target = $ws.CreateShortcut($lnk).TargetPath
+    } catch { $target = '' }
+
+    $isV4 = $target -match 'TaxDome Desktop App'
+    if (-not $isV4 -and $installed -and $installed.InstallLocation) {
+        $isV4 = $target -like "$($installed.InstallLocation)*"
     }
+    if ($isV4) { return }   # already the v4 shortcut, leave it
 
-    # Otherwise find a source shortcut elsewhere and copy one in
-    $src = Get-ChildItem "C:\Users\*\Desktop\*TaxDome*.lnk","C:\Users\Public\Desktop\*TaxDome*.lnk" -ErrorAction SilentlyContinue |
-           Where-Object { $_.DirectoryName -ne $launchDir.TrimEnd('\') } |
-           Select-Object -First 1
+    $keep = Join-Path $pub 'TaxDome v3.lnk'
+    if (Test-Path $keep) { return }   # preserved on a previous run
 
-    if ($src) {
-        Copy-Item $src.FullName $launchDir -Force -ErrorAction SilentlyContinue
-        Write-Host "Shortcut copied to $launchDir" -ForegroundColor Green
-    } else {
-        Write-Host "No TaxDome shortcut found to copy (or already in place)." -ForegroundColor Yellow
+    try {
+        Rename-Item -Path $lnk -NewName 'TaxDome v3.lnk' -Force
+        Write-Host "Old v3 shortcut preserved as 'TaxDome v3.lnk'" -ForegroundColor Green
+    } catch {
+        Write-Warning "Could not preserve v3 shortcut: $($_.Exception.Message)"
     }
 }
 
@@ -92,6 +96,8 @@ if ($installed) {
 
 # --- Install if needed ---
 if ($needInstall) {
+    Protect-V3Shortcut
+
     function Get-Installer($url, $label) {
         Write-Host "Downloading from $label..."
         (New-Object System.Net.WebClient).DownloadFile($url, $exe)
@@ -107,7 +113,7 @@ if ($needInstall) {
         }
     }
 
-    $args = @(
+    $installArgs = @(
         '/install','/quiet','/norestart',
         '/log',$log,
         'TD_VENDOR=Verito',
@@ -116,7 +122,7 @@ if ($needInstall) {
         'TAXDOME_INSTALL_DRIVERS=true'
     )
     Write-Host "Installing..."
-    $p = Start-Process $exe -ArgumentList $args -Wait -PassThru
+    $p = Start-Process $exe -ArgumentList $installArgs -Wait -PassThru
 
     if (Test-Path $exe) {
         Remove-Item $exe -Force -ErrorAction SilentlyContinue
@@ -135,9 +141,6 @@ if ($needInstall) {
         }
     }
 }
-
-# --- Always copy shortcut to launch folder (whether installed or already present) ---
-#Copy-Shortcut
 
 Write-Host ""
 Write-Host "This window will close in 10 seconds..."
