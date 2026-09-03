@@ -23,10 +23,35 @@ $primary  = "https://files.taxdome.com/desktop/win/TaxDome_x64_Latest.exe"
 $fallback = "https://github.com/harshal16saini/provisioning-toolkit/releases/download/v4.8.2/TaxDome_x64.exe"  # emergency mirror; refresh occasionally
 $exe   = "C:\Temp\TaxDome_x64.exe"
 $log   = "C:\Temp\td_install.log"
-$unlog = "C:\Temp\td_uninstall.log"
 $tdProps = 'TD_VENDOR=Verito','TD_AUTO_UPDATE=false','TAXDOME_INSTALL_APP=true','TAXDOME_INSTALL_DRIVERS=true'
 
 New-Item -ItemType Directory -Path 'C:\Temp' -Force | Out-Null
+
+# --- Helpers ---
+function Stop-TaxDome {
+    # Kills TaxDome in ALL sessions (admin on RDS kills other users' instances too).
+    # Electron = several processes; MSI fails with 1603 "files in use" if any survive.
+    $procs = Get-Process -Name 'TaxDome*' -ErrorAction SilentlyContinue
+    if ($procs) {
+        Write-Host "Stopping $($procs.Count) TaxDome process(es)..."
+        $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+    }
+    Get-Service -Name 'TaxDome*' -ErrorAction SilentlyContinue |
+        Where-Object Status -ne 'Stopped' |
+        Stop-Service -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 3
+    $left = Get-Process -Name 'TaxDome*' -ErrorAction SilentlyContinue
+    if ($left) { Write-Warning "$($left.Count) TaxDome process(es) still running - install may fail with 1603." }
+}
+
+function Set-RdsInstallMode([bool]$on) {
+    # No-op on non-RDS hosts (change.exe returns an error we ignore).
+    $chg = Join-Path $env:SystemRoot 'System32\change.exe'
+    if (Test-Path $chg) {
+        $mode = if ($on) { '/install' } else { '/execute' }
+        & $chg user $mode *> $null
+    }
+}
 
 # --- Detect installed v4 app (NOT the v3 "TaxDome" entry) ---
 $installed = Get-ItemProperty `
@@ -49,7 +74,7 @@ function Get-Installer($url, $label) {
     Write-Host "Downloading from $label..."
     $curl = Join-Path $env:SystemRoot 'System32\curl.exe'
     if (Test-Path $curl) {
-        & $curl -L -s -o $exe $url
+        & $curl -L -s -f -o $exe $url
         if ($LASTEXITCODE -ne 0) { throw "curl.exe exit $LASTEXITCODE" }
     } else {
         Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
@@ -97,36 +122,37 @@ if ((Test-Path $lnk) -and -not (Test-Path (Join-Path $pub 'TaxDome v3.lnk'))) {
     } catch { Write-Warning "Could not check/preserve v3 shortcut: $($_.Exception.Message)" }
 }
 
-# --- Uninstall existing v4 first (avoids reboot on upgrade) ---
-if ($installed) {
-    $raw = $installed.QuietUninstallString
-    if ([string]::IsNullOrWhiteSpace($raw)) { $raw = $installed.UninstallString }
-    $unExe = $null
-    if ($raw -match '^\s*"([^"]+)"') { $unExe = $Matches[1] }
-    elseif ($raw) { $unExe = ($raw -split '\s+')[0] }
-
-    if ($unExe -and (Test-Path $unExe)) {
-        Write-Host "Uninstalling existing TaxDome v4 ($instVer)..."
-        $u = Start-Process $unExe -ArgumentList (@('/uninstall','/quiet','/norestart','/log',$unlog) + $tdProps) -Wait -PassThru
-        if ($u.ExitCode -notin 0,3010) {
-            Write-Warning "Uninstall exit code $($u.ExitCode). See $unlog. Continuing with direct install (may require reboot)."
-        } else {
-            Write-Host "Old version uninstalled." -ForegroundColor Green
-        }
-    } else {
-        Write-Warning "Cached uninstaller not found. Direct in-place install (may require reboot)."
-    }
-}
+# NOTE: no manual pre-uninstall. The new bundle performs the MajorUpgrade of the
+# old 4.x bundle itself; running the old uninstaller first was returning 1619.
 
 # --- Install ---
+Stop-TaxDome
+Set-RdsInstallMode $true
 Write-Host "Installing..."
 $p = Start-Process $exe -ArgumentList (@('/install','/quiet','/norestart','/log',$log) + $tdProps) -Wait -PassThru
+Set-RdsInstallMode $false
 Remove-Item $exe -Force -ErrorAction SilentlyContinue
 
+$rebootNeeded = $false
 switch ($p.ExitCode) {
     0     { Write-Host "TaxDome installed successfully." -ForegroundColor Green }
-    3010  { Write-Host "Installed successfully - reboot required." -ForegroundColor Yellow }
+    3010  { $rebootNeeded = $true }
+    1641  { $rebootNeeded = $true }   # ERROR_SUCCESS_REBOOT_INITIATED - Dokan driver swap needs a restart
     default { Write-Host "Install FAILED, exit code $($p.ExitCode). See $log" -ForegroundColor Red }
+}
+
+if ($rebootNeeded) {
+    Write-Host ""
+    Write-Host "REBOOT REQUIRED (exit $($p.ExitCode)). The Dokan driver was replaced; TaxDome itself is not installed yet." -ForegroundColor Yellow
+    Write-Host "After the reboot, re-run this installer BEFORE anyone opens TaxDome. It will finish in one pass." -ForegroundColor Yellow
+    Write-Host ""
+    $ans = Read-Host "Reboot now? (Y/N)"
+    if ($ans -match '^[Yy]') {
+        Write-Host "Rebooting in 15 seconds..."
+        shutdown.exe /r /t 15 /c "TaxDome driver update - rebooting to complete install"
+    } else {
+        Write-Host "Reboot skipped. Nothing else will install until the machine restarts." -ForegroundColor Yellow
+    }
 }
 
 Write-Host ""
