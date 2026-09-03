@@ -27,7 +27,7 @@ public static class ConsoleMode {
 # --- Config ---
 $version    = 'v4.8.2'
 $minVersion = [version]'4.8.2.9467'   # the version this script installs; compare against this
-$primary  = "https://taxdome-public.s3.amazonaws.com/desktop/win/$version/TaxDome_x64.exe"
+$primary  = "https://files.taxdome.com/desktop/win/TaxDome_x64_Latest.exe"
 $fallback = "https://github.com/harshal16saini/provisioning-toolkit/releases/download/$version/TaxDome_x64.exe"
 $exe = "C:\Temp\TaxDome_x64.exe"
 $log = "C:\Temp\td_install.log"
