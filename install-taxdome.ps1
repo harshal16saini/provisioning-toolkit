@@ -2,9 +2,11 @@
     install-taxdome.ps1  —  unattended TaxDome v4 installer (RDS-aware)
 
     Runs ONCE. If the install returns 1641/3010 (Dokan driver swap needs a
-    restart), it registers a SYSTEM "at startup" scheduled task, reboots, and
-    the task re-runs THIS script with -Resume to finish the install before any
-    user logs in. On completion it self-cleans the task, state, and cached exe.
+    restart), it registers a SYSTEM "at startup" scheduled task and then ASKS
+    whether to reboot now (Y/N, defaults to NO after 60s - it never reboots on
+    its own). Either way the task re-runs THIS script with -Resume at the next
+    boot to finish the install before any user logs in, then self-cleans the
+    task, state, and cached exe. No second manual run is ever needed.
 
     Two supported ways to run it:
       1. Directly - save this file and run it: double-click > "Run with PowerShell",
@@ -28,15 +30,22 @@ $ProgressPreference    = 'SilentlyContinue'
 
 # --- Self-elevate (so the script works run directly, not just via the elevated .bat) ---
 # SYSTEM (the resume task) and any elevated admin console pass straight through.
-$__id      = [Security.Principal.WindowsIdentity]::GetCurrent()
-$__isSystem = $__id.User.Value -eq 'S-1-5-18'
-$__isAdmin  = (New-Object Security.Principal.WindowsPrincipal($__id)).IsInRole(
-                  [Security.Principal.WindowsBuiltInRole]::Administrator)
+# Guarded: if the identity APIs are unavailable (e.g. Constrained Language Mode), assume we are
+# elevated rather than die - the supported launchers (.bat / SYSTEM task) are always elevated.
+$__isAdmin = $true; $__isSystem = $false
+try {
+    $__id       = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $__isSystem = $__id.User.Value -eq 'S-1-5-18'
+    $__isAdmin  = (New-Object Security.Principal.WindowsPrincipal($__id)).IsInRole(
+                      [Security.Principal.WindowsBuiltInRole]::Administrator)
+} catch { }
 if (-not ($__isAdmin -or $__isSystem)) {
     if ($PSCommandPath) {
         Write-Host "Not elevated - relaunching as administrator..." -ForegroundColor Yellow
-        $relaunchArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File', $PSCommandPath)
-        if ($Resume) { $relaunchArgs += '-Resume' }
+        # Single pre-quoted string: Windows PowerShell 5.1 does NOT quote array elements that contain
+        # spaces, so a profile path like C:\Users\John Smith\... would otherwise be split.
+        $relaunchArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+        if ($Resume) { $relaunchArgs += ' -Resume' }
         try { Start-Process powershell.exe -Verb RunAs -ArgumentList $relaunchArgs } catch {
             Write-Host "Elevation was cancelled or failed. Run this from an elevated PowerShell, or use install-taxdome.bat." -ForegroundColor Red
         }
@@ -58,6 +67,12 @@ $Transcript   = Join-Path $StableDir 'td-provision.log'         # full unattende
 $TaskName     = 'Verito-TaxDome-ResumeInstall'
 $MaxAttempts  = 3   # first pass + up to 2 post-reboot resumes, then bail (loop guard)
 
+# Reboot policy. The FIRST pass never auto-reboots: it asks Y/N (default NO). If the RESUME pass -
+# which runs as SYSTEM at boot, before anyone logs in, with nobody to ask - ever needs a further
+# reboot (rare), this decides it. $true = reboot automatically at that pre-login moment so the install
+# always completes; $false = never auto-reboot, leave the task armed until the next manual restart.
+$AutoRebootOnResume = $true
+
 # Defensive fallback only. The supported launcher (install-taxdome.bat) downloads this
 # script to $StableScript and runs it with -File, so $PSCommandPath is normally already set.
 $ScriptSourceUrl = 'https://raw.githubusercontent.com/harshal16saini/provisioning-toolkit/main/install-taxdome.ps1'
@@ -74,7 +89,9 @@ $primary = 'https://files.taxdome.com/desktop/win/TaxDome_x64_Latest.exe'
 New-Item -ItemType Directory -Path $StableDir -Force | Out-Null
 New-Item -ItemType Directory -Path 'C:\Temp'  -Force | Out-Null
 
-Start-Transcript -Path $Transcript -Append -Force | Out-Null
+# Best-effort: if transcription is already active in the launching console (or unavailable), keep going.
+$__transcribing = $false
+try { Start-Transcript -Path $Transcript -Append -Force | Out-Null; $__transcribing = $true } catch { }
 
 function Write-Log {
     param([string]$Msg, [ValidateSet('INFO','WARN','ERROR','OK')][string]$Level = 'INFO')
@@ -84,9 +101,9 @@ function Write-Log {
 }
 
 # Run a native exe without PS 5.1's NativeCommandError trap (stderr + EAP=Stop = terminating error).
-function Invoke-Native([string]$Path, [string[]]$Args) {
+function Invoke-Native([string]$Path, [string[]]$ArgList) {
     try {
-        $p = Start-Process -FilePath $Path -ArgumentList $Args -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
+        $p = Start-Process -FilePath $Path -ArgumentList $ArgList -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
         return $p.ExitCode
     } catch { return -1 }
 }
@@ -216,7 +233,8 @@ function Set-Attempt([int]$n) {
 }
 
 function Register-ResumeTask([string]$ScriptPath) {
-    $action    = New-ScheduledTaskAction -Execute 'powershell.exe' `
+    $psExe     = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $action    = New-ScheduledTaskAction -Execute $psExe `
                     -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$ScriptPath`" -Resume"
     $trigger   = New-ScheduledTaskTrigger -AtStartup
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
@@ -240,6 +258,28 @@ function Complete-Cleanup {
     Write-Log "Cleanup done: resume task, cached installer, script copy, and state removed." 'OK'
 }
 
+function Read-YesNoTimeout {
+    # Console Y/N prompt with a timeout. Defaults to $Default if no key is pressed, or if there is
+    # no interactive console (ISE, redirected stdin, service) - so it can never hang an unattended run.
+    param([string]$Prompt, [int]$TimeoutSec = 60, [bool]$Default = $false)
+    $defTxt = if ($Default) { 'YES' } else { 'NO' }
+    Write-Host ""
+    Write-Host "$Prompt  [Y/N]   (auto-selects $defTxt in ${TimeoutSec}s)" -ForegroundColor Cyan
+    try {
+        $deadline = (Get-Date).AddSeconds($TimeoutSec)
+        while ((Get-Date) -lt $deadline) {
+            if ($host.UI.RawUI.KeyAvailable) {
+                $k = $host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+                if ($k.Character -in 'y','Y') { Write-Host 'Y'; return $true }
+                if ($k.Character -in 'n','N') { Write-Host 'N'; return $false }
+            }
+            Start-Sleep -Milliseconds 200
+        }
+    } catch { }   # no interactive console: fall through to the default
+    Write-Host "(no answer - defaulting to $defTxt)"
+    return $Default
+}
+
 function Invoke-RebootPath([int]$ThisAttempt, [int]$ExitCode) {
     if ($ThisAttempt -ge $MaxAttempts) {
         Write-Log "Reboot required AGAIN after $($ThisAttempt-1) prior pass(es). Max attempts ($MaxAttempts) hit - NOT rebooting to avoid a loop." 'ERROR'
@@ -253,29 +293,50 @@ function Invoke-RebootPath([int]$ThisAttempt, [int]$ExitCode) {
 
     Set-Attempt $ThisAttempt
     Register-ResumeTask -ScriptPath $StableScript
-    Write-Log "Registered SYSTEM startup task '$TaskName'. Install will resume automatically after reboot." 'OK'
+    Write-Log "Registered SYSTEM startup task '$TaskName'. The install finishes automatically on the next reboot - no re-run needed." 'OK'
 
-    # Unattended-safe reboot (replaces Read-Host). 60s window; abort with: shutdown /a
-    # (shutdown /a writes to stderr when nothing is pending; isolate it from the Stop trap.)
+    # Decide whether to reboot now. The FIRST pass asks the operator (default NO, so nothing reboots
+    # unless explicitly confirmed). The RESUME pass runs as SYSTEM at boot with nobody to ask; see
+    # $AutoRebootOnResume below for how that (rare) case is handled.
+    if ($Resume) {
+        if (-not $AutoRebootOnResume) {
+            Write-Log "Resume pass still needs a reboot. Task re-armed; the install completes on the next restart." 'WARN'
+            return
+        }
+        Write-Log "Resume pass still needs a reboot (pre-login, no users affected). Rebooting automatically." 'WARN'
+        $doReboot = $true
+    } else {
+        $doReboot = Read-YesNoTimeout -Prompt "Reboot now to finish the TaxDome install?" -TimeoutSec 60 -Default $false
+    }
+
+    if (-not $doReboot) {
+        Write-Log "Reboot deferred. Task '$TaskName' stays armed; the install completes automatically whenever this machine next restarts." 'WARN'
+        return
+    }
+
+    # Confirmed: reboot with a short countdown. (shutdown /a writes to stderr when nothing is
+    # pending; both calls are isolated from the Stop trap.)
     try { $ErrorActionPreference = 'Continue'; & shutdown.exe /a 2>$null } catch { } finally { $ErrorActionPreference = 'Stop' }
-    Write-Log "Rebooting in 60s to complete the Dokan driver swap. Abort with:  shutdown /a" 'WARN'
+    Write-Log "Rebooting in 15s to complete the Dokan driver swap. Abort with:  shutdown /a" 'WARN'
     try {
         $ErrorActionPreference = 'Continue'
-        & shutdown.exe /r /t 60 /c "TaxDome driver update - rebooting to finish install" 2>$null
+        & shutdown.exe /r /t 15 /c "TaxDome driver update - rebooting to finish install" 2>$null
         $rc = $LASTEXITCODE
     } finally { $ErrorActionPreference = 'Stop' }
     if ($rc -ne 0) {
-        Write-Log "shutdown.exe exit $rc - reboot not scheduled. Task is registered; reboot manually to resume." 'ERROR'
+        Write-Log "shutdown.exe exit $rc - reboot not scheduled. Task is armed; reboot manually to finish." 'ERROR'
     } else {
-        Write-Log "Reboot scheduled. Machine restarts in 60s." 'OK'
+        Write-Log "Reboot scheduled. Machine restarts in 15s." 'OK'
     }
 }
 
 # --- Main --------------------------------------------------------------------
 $installExit = $null
 try {
-    $priorAttempts = Get-Attempt
-    $thisAttempt   = $priorAttempts + 1
+    # A first (non-resume) pass always starts a NEW cycle. Only the resume pass reads the counter -
+    # otherwise a stale state file left from a previous MaxAttempts bail would block fresh runs forever.
+    if ($Resume) { $priorAttempts = Get-Attempt } else { $priorAttempts = 0; Remove-Item $StateFile -Force -ErrorAction SilentlyContinue }
+    $thisAttempt = $priorAttempts + 1
     Write-Log "=== TaxDome install pass (attempt $thisAttempt, Resume=$([bool]$Resume)) ===" 'OK'
 
     # Detect installed v4 app (NOT the v3 "TaxDome" entry)
@@ -312,44 +373,46 @@ try {
 
     if ($newVer -eq [version]'0.0.0.0') {
         Write-Log "Could not read installer version. Proceeding with install anyway." 'WARN'
+    } elseif ($Resume) {
+        # Never skip on resume: this pass exists to COMPLETE a pending install. Even if the installer
+        # wrote its version to the registry before the reboot, the app is not finished. Re-running the
+        # bundle when it is already complete is an idempotent repair that returns 0, so this is safe.
+        Write-Log "Resume pass: completing the pending install regardless of registry version ($instVer)."
     } elseif ($instVer -ge $newVer) {
         Write-Log "Installed version ($instVer) is same or newer. Nothing to do." 'OK'
         Remove-Item $exe -Force -ErrorAction SilentlyContinue
-        Complete-Cleanup   # clear any leftover task/state if this fired on a resume boot
+        Complete-Cleanup   # clear any leftover task/state from a prior cycle
         return
-    }
-
-    # Preserve the old (v3) shortcut before v4's installer overwrites it: rename the Public Desktop
-    # "TaxDome.lnk" to "TaxDome v3.lnk" so the v4 installer creates its new "TaxDome" shortcut in place.
-    # Primary trigger (original behavior): the shortcut's target points into C:\Program Files (x86)\TaxDome.
-    # Fallback: if the target can't be read (an MSI-advertised shortcut returns an empty TargetPath),
-    # but that v3 dir exists, still treat it as v3 - otherwise we'd skip and let v4 clobber the shortcut.
-    $pub   = Join-Path $env:PUBLIC 'Desktop'
-    $lnk   = Join-Path $pub 'TaxDome.lnk'
-    $keep  = Join-Path $pub 'TaxDome v3.lnk'
-    $v3Dir = 'C:\Program Files (x86)\TaxDome'
-    if ((Test-Path $lnk) -and -not (Test-Path $keep)) {
-        $isV3 = $false
-        try {
-            $target = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk).TargetPath
-            if ($target -like "$v3Dir\*") { $isV3 = $true }
-        } catch { }
-        if (-not $isV3 -and (Test-Path $v3Dir)) { $isV3 = $true }   # advertised / empty-target fallback
-        if ($isV3) {
-            try {
-                Rename-Item -Path $lnk -NewName 'TaxDome v3.lnk' -Force
-                Write-Log "Old v3 shortcut renamed to 'TaxDome v3.lnk' (v4 installer will create the new TaxDome shortcut)." 'OK'
-            } catch { Write-Log "Could not rename v3 shortcut: $($_.Exception.Message)" 'WARN' }
-        } else {
-            Write-Log "Desktop 'TaxDome.lnk' does not look like a v3 shortcut; leaving it as-is." 'INFO'
-        }
     }
 
     # NOTE: no manual pre-uninstall. The new bundle performs the MajorUpgrade of the
     # old 4.x bundle itself; running the old uninstaller first was returning 1619.
 
-    # Secure the resume path BEFORE mutating the system. Throws (and aborts) if it can't.
+    # Secure the resume path BEFORE mutating anything. Throws (and aborts) if it can't.
+    # Everything below this line changes the system; nothing above it does.
     Ensure-StableCopy
+
+    # Preserve the old (v3) shortcut before v4's installer overwrites it: ONLY if the Public Desktop
+    # "TaxDome.lnk" positively points into the v3 install dir (C:\Program Files (x86)\TaxDome), rename
+    # it to "TaxDome v3.lnk" so the v4 installer can create its new shortcut in place.
+    # A v4 shortcut (target under C:\Program Files\TaxDome - no "(x86)") is a DIFFERENT path and is
+    # left untouched; it simply points at the updated exe after the upgrade. An unreadable target is
+    # also left as-is (we never rename on a guess).
+    $pub  = Join-Path $env:PUBLIC 'Desktop'
+    $lnk  = Join-Path $pub 'TaxDome.lnk'
+    $keep = Join-Path $pub 'TaxDome v3.lnk'
+    if ((Test-Path $lnk) -and -not (Test-Path $keep)) {
+        $target = $null
+        try { $target = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk).TargetPath } catch { }
+        if ($target -like 'C:\Program Files (x86)\TaxDome\*') {
+            try {
+                Rename-Item -Path $lnk -NewName 'TaxDome v3.lnk' -Force
+                Write-Log "v3 shortcut renamed to 'TaxDome v3.lnk' (target: $target)." 'OK'
+            } catch { Write-Log "Could not rename v3 shortcut: $($_.Exception.Message)" 'WARN' }
+        } else {
+            Write-Log "Desktop 'TaxDome.lnk' target is not v3 ('$target'); leaving it as-is." 'INFO'
+        }
+    }
 
     # --- Install ---
     Stop-TaxDome
@@ -389,7 +452,7 @@ finally {
     # Clean the transient installer on every exit path (on the reboot path it was already
     # moved to $CachedExe, so this is a no-op there). Prevents a leftover locking the next run.
     Remove-Item $exe -Force -ErrorAction SilentlyContinue
-    Stop-Transcript | Out-Null
+    if ($__transcribing) { try { Stop-Transcript | Out-Null } catch { } }
     if (-not $Resume) {
         Write-Host ""
         Write-Host "This window will close in 10 seconds..."
